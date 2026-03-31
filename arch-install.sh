@@ -15,11 +15,11 @@ set -euo pipefail
 TARGET_DISK="/dev/nvme0n1"          # SSD1 — root + home
 # SSD2 (/dev/nvme1n1) is NEVER touched
 EFI_SIZE="512M"
-HOSTNAME="archbox"
+HOSTNAME="arch"
 TIMEZONE="Europe/Istanbul"
 LOCALE="en_US.UTF-8"
-KEYMAP="trq"
-USERNAME="user"
+KEYMAP="us"
+USERNAME="rmx"
 USER_SHELL="/bin/zsh"
 
 # Partition labels
@@ -38,9 +38,9 @@ BTRFS_OPTS="defaults,compress=zstd:3,noatime,nodiratime,space_cache=v2"
 
 # CachyOS mirror (auto-detected below; fallback hardcoded)
 CACHYOS_KEYRING_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst"
-CACHYOS_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-18-1-any.pkg.tar.zst"
-CACHYOS_V4_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-v4-mirrorlist-6-1-any.pkg.tar.zst"
-CACHYOS_REPO_PKG_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-repo-1.0.3-1-any.pkg.tar.zst"
+CACHYOS_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-22-1-any.pkg.tar.zst"
+CACHYOS_V4_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-v4-mirrorlist-22-1-any.pkg.tar.zst"
+CACHYOS_REPO_PKG_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/pacman-7.1.0.r9.g54d9411-2-x86_64.pkg.tar.zst"
 
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -217,9 +217,9 @@ step() { echo -e "\n${CYAN}${BOLD}╔══ CHROOT STEP $* ══╗${RESET}"; }
 
 TIMEZONE="Europe/Istanbul"
 LOCALE="en_US.UTF-8"
-KEYMAP="trq"
-HOSTNAME="archbox"
-USERNAME="user"
+KEYMAP="us"
+HOSTNAME="arch"
+USERNAME="rmx"
 PART_ROOT="/dev/nvme0n1p2"
 BTRFS_OPTS="defaults,compress=zstd:3,noatime,nodiratime,space_cache=v2"
 
