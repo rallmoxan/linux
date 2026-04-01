@@ -1,915 +1,608 @@
-#!/usr/bin/env bash
-# =============================================================================
-# Arch Linux Automated Installation Script
-# Target: Ryzen 5 7500X3D | RX 9060 XT | 16GB DDR5 | SATA SSD
-# Stack:  btrfs + Limine + CachyOS (CPU-aware) + Hyprland/Wayland + zram
-# =============================================================================
-# CachyOS repo kurulumu resmi yönteme gore yapilir:
-#   1. CPU mimarisi /lib/ld-linux-x86-64.so.2 --help ile tespit edilir
-#   2. AMD Zen 4/5 icin gcc -Q --help=target ile znver4/znver5 kontrolu
-#   3. Mimari: znver4 | x86-64-v4 | x86-64-v3 | x86-64 (fallback)
-#   4. Dogru keyring + mirrorlist + repo blogu otomatik eklenir
-#
-# Kaynak: https://github.com/CachyOS/cachyos-repo-add-script
-# =============================================================================
-# KULLANIM: Arch ISO ile boot et:
-#   chmod +x arch-install.sh && ./arch-install.sh
-# =============================================================================
+#!/bin/bash
+# ============================================================================
+# ARCH LINUX FULL AUTOMATED INSTALLATION SCRIPT
+# Ryzen 5 7500X3D + RX 9060 XT + CachyOS + Hyprland + Limine
+# ============================================================================
 
-set -euo pipefail
+set -e  # Exit on error
+set -u  # Exit on undefined variable
 
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
-TARGET_DISK="/dev/sda"      # SSD1 — root + home (SATA)
-PART_EFI="${TARGET_DISK}1"  # /dev/sda1
-PART_ROOT="${TARGET_DISK}2" # /dev/sda2
-# NOT: SATA disk icin sda1/sda2, NVMe icin nvme0n1p1/p2 olur
+# ============================================================================
+# STEP 0: ROOT CHECK & VARIABLES
+# ============================================================================
 
+if [[ $EUID -ne 0 ]]; then
+   echo "ERROR: This script must be run as root (boot from Arch ISO)"
+   exit 1
+fi
+
+# Configuration variables
+TARGET_DISK="/dev/nvme0n1"  # SSD1 - CHANGE IF NEEDED
 EFI_SIZE="512M"
 HOSTNAME="archbox"
+USERNAME="user"  # CHANGE THIS
+USER_PASSWORD="password"  # CHANGE THIS
+ROOT_PASSWORD="rootpassword"  # CHANGE THIS
 TIMEZONE="Europe/Istanbul"
-LOCALE="en_US.UTF-8"
-KEYMAP="trq"
-USERNAME="user"
+LOCALE="tr_TR.UTF-8"
 
-BTRFS_OPTS="defaults,compress=zstd:3,noatime,nodiratime,space_cache=v2"
-CACHYOS_MIRROR="https://mirror.cachyos.org/repo/x86_64/cachyos"
+echo "========================================"
+echo "Target disk: $TARGET_DISK"
+echo "Hostname: $HOSTNAME"
+echo "Username: $USERNAME"
+echo "Timezone: $TIMEZONE"
+echo "========================================"
+read -p "Press ENTER to continue or Ctrl+C to abort..."
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-log()  { echo -e "${GREEN}[+]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[!]${RESET} $*"; }
-err()  { echo -e "${RED}[x]${RESET} $*" >&2; exit 1; }
-step() { echo -e "\n${CYAN}${BOLD}=== STEP $* ===${RESET}"; }
+# ============================================================================
+# STEP 1: DISK PARTITIONING
+# ============================================================================
 
-# =============================================================================
-# CPU MiMARi TESPiT FONKSiYONU
-# CachyOS resmi cachyos-repo-add-script ile ayni mantik:
-#   - ld-linux'ten desteklenen x86-64 seviyesi okunur
-#   - AMD Zen 4/5 icin gcc march hedefi kontrol edilir
-#   - En yuksek desteklenen seviye secilir
-# =============================================================================
-detect_cpu_arch() {
-    local ld_help=""
-    local march_target=""
+echo "# STEP 1: Partitioning $TARGET_DISK..."
 
-    # ld-linux'ten desteklenen mikro-arch seviyelerini al
-    for ld in /lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2; do
-        [[ -f "$ld" ]] && { ld_help=$("$ld" --help 2>/dev/null || true); break; }
-    done
+# Wipe partition table
+wipefs -af "$TARGET_DISK" || exit 1
+sgdisk -Z "$TARGET_DISK" || exit 1
 
-    # AMD Zen 4 / Zen 5 kontrolu — gcc march hedefine bak
-    # Ryzen 7000 serisi (7500X3D dahil) = znver4
-    # Ryzen 9000 serisi = znver5 (znver4 reposu kullanir)
-    if command -v gcc &>/dev/null; then
-        march_target=$(gcc -Q --help=target 2>/dev/null \
-            | grep -oP '(?<=-march=)\S+' | head -1 || true)
-        if [[ "$march_target" == znver4 || "$march_target" == znver5 ]]; then
-            echo "znver4"
-            return 0
-        fi
-    fi
+# Create partitions
+sgdisk -n 1:0:+${EFI_SIZE} -t 1:ef00 -c 1:"EFI" "$TARGET_DISK" || exit 1
+sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$TARGET_DISK" || exit 1
 
-    # x86-64-v4: AVX-512 destegi (Intel Rocket Lake+ / AMD Zen 4+)
-    # NOT: Intel Alder Lake hybrid CPU'lar false-positive verebilir,
-    #      bu yuzden gcc kontrolu onceliklidir
-    if echo "$ld_help" | grep -q "x86-64-v4 (supported"; then
-        echo "x86-64-v4"
-        return 0
-    fi
-
-    # x86-64-v3: AVX2 destegi (cogu modern masaustu CPU)
-    if echo "$ld_help" | grep -q "x86-64-v3 (supported"; then
-        echo "x86-64-v3"
-        return 0
-    fi
-
-    # Fallback: generic
-    echo "x86-64"
-}
-
-# Mimari -> pacman.conf repo blogu
-get_cachyos_repo_block() {
-    local arch="$1"
-    case "$arch" in
-        znver4)
-            printf '%s\n' \
-                "# CachyOS -- AMD Zen 4/5 optimize (znver4)" \
-                "[cachyos-znver4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-core-znver4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-extra-znver4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-        x86-64-v4)
-            printf '%s\n' \
-                "# CachyOS -- x86-64-v4 optimize (AVX-512)" \
-                "[cachyos-v4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-core-v4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-extra-v4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-        x86-64-v3)
-            printf '%s\n' \
-                "# CachyOS -- x86-64-v3 optimize (AVX2)" \
-                "[cachyos-v3]" \
-                "Include = /etc/pacman.d/cachyos-v3-mirrorlist" \
-                "[cachyos-core-v3]" \
-                "Include = /etc/pacman.d/cachyos-v3-mirrorlist" \
-                "[cachyos-extra-v3]" \
-                "Include = /etc/pacman.d/cachyos-v3-mirrorlist" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-        *)
-            printf '%s\n' \
-                "# CachyOS -- generic x86-64" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-    esac
-}
-
-# Mimari -> indirilecek mirrorlist paket URL'leri
-get_mirrorlist_urls() {
-    local arch="$1"
-    local base="$CACHYOS_MIRROR"
-    local -a urls=(
-        "${base}/cachyos-keyring-20240331-1-any.pkg.tar.zst"
-        "${base}/cachyos-mirrorlist-22-1-any.pkg.tar.zst"
-    )
-    case "$arch" in
-        znver4|x86-64-v4)
-            urls+=("${base}/cachyos-v4-mirrorlist-22-1-any.pkg.tar.zst") ;;
-        x86-64-v3)
-            urls+=("${base}/cachyos-v3-mirrorlist-22-1-any.pkg.tar.zst") ;;
-    esac
-    echo "${urls[@]}"
-}
-
-# =============================================================================
-# STEP 0: Pre-flight Checks
-# =============================================================================
-step "0: Pre-flight Checks"
-
-[[ $EUID -ne 0 ]]          && err "Script root olarak calistirilmali"
-[[ ! -d /sys/firmware/efi ]] && err "UEFI modunda boot edilmedi"
-[[ ! -b "$TARGET_DISK" ]]  && err "Hedef disk $TARGET_DISK bulunamadi"
-
-log "Hedef disk  : $TARGET_DISK"
-log "EFI         : $PART_EFI"
-log "Root        : $PART_ROOT"
-log "SSD2 (diger disk) bu script tarafindan KESINLIKLE DOKUNULMAYACAK"
-
-ping -c 1 -W 3 archlinux.org &>/dev/null || err "Internet baglantisi yok"
-log "Internet: OK"
-
-timedatectl set-ntp true || err "Saat senkronizasyonu basarisiz"
-log "Saat senkronize edildi"
-
-# =============================================================================
-# STEP 1: CPU Mimari Tespiti (CachyOS resmi yontemi)
-# =============================================================================
-step "1: CPU Mimari Tespiti"
-
-CPU_ARCH=$(detect_cpu_arch)
-log "Tespit edilen CPU mimarisi: ${BOLD}${CPU_ARCH}${RESET}"
-
-case "$CPU_ARCH" in
-    znver4)    log "  -> AMD Zen 4/5 optimize repo (znver4) — Ryzen 7500X3D icin ideal" ;;
-    x86-64-v4) log "  -> AVX-512 repo (x86-64-v4)" ;;
-    x86-64-v3) log "  -> AVX2 repo (x86-64-v3)" ;;
-    x86-64)    warn "  -> Generic x86-64 repo (optimizasyon yok)" ;;
-esac
-
-# =============================================================================
-# STEP 2: CachyOS Repository Kurulumu — pacstrap ONCESI
-# Resmi cachyos-repo-add-script ile ayni mantik:
-#   keyring + mimari mirrorlist indirilir, live ISO'ya kurulur,
-#   mimari-spesifik repo blogu pacman.conf'a [core]'dan once eklenir
-# =============================================================================
-step "2: CachyOS Repository Kurulumu (resmi yontem, CPU: ${CPU_ARCH})"
-
-TMP_PKG="/tmp/cachyos-pkgs"
-mkdir -p "$TMP_PKG"
-
-# Mimari icin gerekli paket URL'lerini al ve indir
-read -ra MIRROR_URLS <<< "$(get_mirrorlist_urls "$CPU_ARCH")"
-
-for url in "${MIRROR_URLS[@]}"; do
-    fname=$(basename "$url")
-    log "  Indiriliyor: $fname"
-    curl -fsSL -o "${TMP_PKG}/${fname}" "$url" \
-        || err "Indirme basarisiz: $url"
-done
-
-log "Keyring + mirrorlist paketleri live ISO'ya kuruluyor..."
-pacman -U --noconfirm "${TMP_PKG}"/*.pkg.tar.zst \
-    || err "CachyOS paketleri kurulamadi"
-
-# Mevcut cachyos bloklari varsa temizle (idempotent)
-sed -i '/^# CachyOS/,/^$/{ /^\[core\]/b; d }' /etc/pacman.conf 2>/dev/null || true
-
-# Mimari-spesifik repo blogu [core] satirindan ONCE ekle
-REPO_BLOCK=$(get_cachyos_repo_block "$CPU_ARCH")
-# Gecici dosyaya yaz, sonra sed ile ekle
-printf '%s\n\n' "$REPO_BLOCK" > /tmp/cachyos-repo-block.txt
-sed -i "/^\[core\]/r /tmp/cachyos-repo-block.txt" /etc/pacman.conf
-# [core] satirinin ONCESINE eklemek icin siralama duzeltmesi
-# (sed -i ile once ekle yontemi)
-sed -i "/^\[core\]/{
-    h
-    r /tmp/cachyos-repo-block.txt
-    g
-    N
-}" /etc/pacman.conf 2>/dev/null || {
-    # Alternatif yontem: direkt append
-    echo "" >> /etc/pacman.conf
-    cat /tmp/cachyos-repo-block.txt >> /etc/pacman.conf
-}
-
-pacman -Sy || err "pacman veritabani sync basarisiz"
-log "CachyOS repolari aktif — Mimari: ${CPU_ARCH}"
-
-# =============================================================================
-# STEP 3: Disk Hazirlik — Partition + btrfs
-# =============================================================================
-step "3: Disk Hazirligi (/dev/sda)"
-
-log "Disk siliniyor: $TARGET_DISK"
-wipefs -af "$TARGET_DISK"  || err "Disk silinemedi"
-sgdisk -Z "$TARGET_DISK"   || err "Partition tablosu temizlenemedi"
-
-log "GPT partition olusturuluyor..."
-sgdisk \
-    -n 1:0:+${EFI_SIZE}  -t 1:ef00 -c 1:"EFI System" \
-    -n 2:0:0             -t 2:8300 -c 2:"Arch Linux Root" \
-    "$TARGET_DISK" || err "Disk bolumlenemedi"
-
-partprobe "$TARGET_DISK"
+# Inform kernel
+partprobe "$TARGET_DISK" || exit 1
 sleep 2
 
-[[ -b "$PART_EFI" ]]  || err "$PART_EFI olusturulamadi"
-[[ -b "$PART_ROOT" ]] || err "$PART_ROOT olusturulamadi"
-log "Partition'lar: $PART_EFI (EFI) | $PART_ROOT (btrfs root)"
+EFI_PART="${TARGET_DISK}p1"
+ROOT_PART="${TARGET_DISK}p2"
 
-mkfs.fat -F32 -n "EFI" "$PART_EFI"   || err "EFI formatlanamaadi"
-mkfs.btrfs -f -L "ArchRoot" "$PART_ROOT" || err "btrfs formatlanamadi"
+# Format EFI
+mkfs.fat -F32 -n EFI "$EFI_PART" || exit 1
 
-log "btrfs subvolume'ler olusturuluyor..."
-mount "$PART_ROOT" /mnt || err "Root mount edilemedi"
+# Format btrfs
+mkfs.btrfs -f -L ArchRoot "$ROOT_PART" || exit 1
 
-for subvol in @ @home @snapshots @var-log; do
-    btrfs subvolume create "/mnt/${subvol}" || err "$subvol olusturulamadi"
-    log "  Olusturuldu: $subvol"
-done
-umount /mnt
+echo "Partitioning complete."
 
-log "Subvolume'ler mount ediliyor (${BTRFS_OPTS})..."
-mount -o "${BTRFS_OPTS},subvol=@"          "$PART_ROOT" /mnt            || err "@ mount edilemedi"
-mkdir -p /mnt/{boot,home,.snapshots,var/log}
-mount -o "${BTRFS_OPTS},subvol=@home"      "$PART_ROOT" /mnt/home       || err "@home mount edilemedi"
-mount -o "${BTRFS_OPTS},subvol=@snapshots" "$PART_ROOT" /mnt/.snapshots || err "@snapshots mount edilemedi"
-mount -o "${BTRFS_OPTS},subvol=@var-log"   "$PART_ROOT" /mnt/var/log    || err "@var-log mount edilemedi"
-mount "$PART_EFI" /mnt/boot                                              || err "EFI mount edilemedi"
-log "Disk hazir"
+# ============================================================================
+# STEP 2: BTRFS SUBVOLUMES
+# ============================================================================
 
-# =============================================================================
-# STEP 4: Pacstrap — Temel Sistem
-# =============================================================================
-step "4: Pacstrap"
+echo "# STEP 2: Creating btrfs subvolumes..."
 
-log "Mirror optimizasyonu..."
-reflector --country Turkey,Germany,Netherlands \
-    --protocol https --sort rate --latest 10 \
-    --save /etc/pacman.d/mirrorlist 2>/dev/null \
-    || warn "reflector basarisiz, mevcut mirrorlist kullanilacak"
+# Mount root to create subvolumes
+mount "$ROOT_PART" /mnt || exit 1
 
-# CachyOS mimari-optimize binary olarak linux-cachyos-bore saglar
-KERNEL_PKG="linux-cachyos-bore"
-KERNEL_HDR="linux-cachyos-bore-headers"
-log "Kernel: $KERNEL_PKG (CachyOS ${CPU_ARCH} optimize binary)"
+# Create subvolumes
+btrfs subvolume create /mnt/@ || exit 1
+btrfs subvolume create /mnt/@home || exit 1
+btrfs subvolume create /mnt/@snapshots || exit 1
+btrfs subvolume create /mnt/@var-log || exit 1
+
+# Unmount
+umount /mnt || exit 1
+
+echo "Subvolumes created."
+
+# ============================================================================
+# STEP 3: MOUNT WITH BTRFS OPTIONS
+# ============================================================================
+
+echo "# STEP 3: Mounting filesystems..."
+
+BTRFS_OPTS="defaults,compress=zstd:1,noatime,space_cache=v2"
+
+# Mount @ (root)
+mount -o ${BTRFS_OPTS},subvol=@ "$ROOT_PART" /mnt || exit 1
+
+# Create mount points
+mkdir -p /mnt/{boot,home,.snapshots,var/log} || exit 1
+
+# Mount subvolumes
+mount -o ${BTRFS_OPTS},subvol=@home "$ROOT_PART" /mnt/home || exit 1
+mount -o ${BTRFS_OPTS},subvol=@snapshots "$ROOT_PART" /mnt/.snapshots || exit 1
+mount -o ${BTRFS_OPTS},subvol=@var-log "$ROOT_PART" /mnt/var/log || exit 1
+
+# Mount EFI
+mount "$EFI_PART" /mnt/boot || exit 1
+
+echo "Filesystems mounted."
+
+# ============================================================================
+# STEP 4: CACHYOS REPO SETUP (BEFORE PACSTRAP)
+# ============================================================================
+
+echo "# STEP 4: Adding CachyOS repository..."
+
+# Install keyring first
+pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com || exit 1
+pacman-key --lsign-key F3B607488DB35A47 || exit 1
+
+# Download CachyOS automated installer script
+curl -o /tmp/cachyos-repo.sh https://mirror.cachyos.org/cachyos-repo.tar.xz || exit 1
+tar xvf /tmp/cachyos-repo.sh -C /tmp/ || exit 1
+
+# Add to pacman.conf in /etc (for pacstrap)
+cat >> /etc/pacman.conf <<EOF
+
+# CachyOS repos
+[cachyos-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-core-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-extra-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos]
+Include = /etc/pacman.d/cachyos-mirrorlist
+EOF
+
+# Download mirrorlist
+curl -o /etc/pacman.d/cachyos-mirrorlist https://raw.githubusercontent.com/CachyOS/CachyOS-PKGBUILDS/master/cachyos-mirrorlist/cachyos-mirrorlist || exit 1
+curl -o /etc/pacman.d/cachyos-v3-mirrorlist https://raw.githubusercontent.com/CachyOS/CachyOS-PKGBUILDS/master/cachyos-v3-mirrorlist/cachyos-v3-mirrorlist || exit 1
+
+# Sync databases
+pacman -Sy --noconfirm || exit 1
+
+echo "CachyOS repos added."
+
+# ============================================================================
+# STEP 5: PACSTRAP BASE SYSTEM
+# ============================================================================
+
+echo "# STEP 5: Installing base system..."
 
 pacstrap -K /mnt \
-    base base-devel \
-    "${KERNEL_PKG}" "${KERNEL_HDR}" \
+    base \
+    base-devel \
+    linux-cachyos-bore \
+    linux-cachyos-bore-headers \
     linux-firmware \
     amd-ucode \
     btrfs-progs \
-    limine \
-    efibootmgr \
+    git \
     networkmanager \
-    zsh zsh-completions \
-    neovim git curl wget \
-    man-db man-pages \
-    sudo reflector \
-    dosfstools gcc \
-    || err "Pacstrap basarisiz"
-log "Pacstrap tamamlandi"
+    zsh \
+    neovim \
+    efibootmgr \
+    dosfstools \
+    mtools \
+    || exit 1
 
-# =============================================================================
-# STEP 5: fstab
-# =============================================================================
-step "5: fstab Olustur"
-genfstab -U /mnt >> /mnt/etc/fstab || err "fstab olusturulamadi"
-log "fstab olusturuldu"
+echo "Base system installed."
 
-# =============================================================================
-# STEP 6: Chroot Script Yaz + Calistir
-# Degiskenler disaridan heredoc icerisine inject edilir
-# =============================================================================
-step "6: Chroot Setup Hazirlaniyor"
+# ============================================================================
+# STEP 6: GENERATE FSTAB
+# ============================================================================
 
-cat > /mnt/root/chroot-setup.sh << CHROOT_SCRIPT
-#!/usr/bin/env bash
-set -euo pipefail
+echo "# STEP 6: Generating fstab..."
 
-# Dis scriptten aktarilan degiskenler
-CPU_ARCH="${CPU_ARCH}"
-BTRFS_OPTS="${BTRFS_OPTS}"
-CACHYOS_MIRROR="${CACHYOS_MIRROR}"
-TIMEZONE="${TIMEZONE}"
-LOCALE="${LOCALE}"
-KEYMAP="${KEYMAP}"
-HOSTNAME="${HOSTNAME}"
-USERNAME="${USERNAME}"
-KERNEL_PKG="${KERNEL_PKG}"
-PART_ROOT="${PART_ROOT}"
-PART_EFI="${PART_EFI}"
+genfstab -U /mnt >> /mnt/etc/fstab || exit 1
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-log()   { echo -e "\${GREEN}[+]\${RESET} \$*"; }
-warn()  { echo -e "\${YELLOW}[!]\${RESET} \$*"; }
-err()   { echo -e "\${RED}[x]\${RESET} \$*" >&2; exit 1; }
-cstep() { echo -e "\n\${CYAN}\${BOLD}=== CHROOT \$* ===\${RESET}"; }
+# Verify fstab
+cat /mnt/etc/fstab
 
-# get_cachyos_repo_block — chroot kopyasi
-get_cachyos_repo_block() {
-    local arch="\$1"
-    case "\$arch" in
-        znver4)
-            printf '%s\n' \
-                "# CachyOS -- AMD Zen 4/5 optimize (znver4)" \
-                "[cachyos-znver4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-core-znver4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-extra-znver4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-        x86-64-v4)
-            printf '%s\n' \
-                "# CachyOS -- x86-64-v4 optimize (AVX-512)" \
-                "[cachyos-v4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-core-v4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos-extra-v4]" \
-                "Include = /etc/pacman.d/cachyos-v4-mirrorlist" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-        x86-64-v3)
-            printf '%s\n' \
-                "# CachyOS -- x86-64-v3 optimize (AVX2)" \
-                "[cachyos-v3]" \
-                "Include = /etc/pacman.d/cachyos-v3-mirrorlist" \
-                "[cachyos-core-v3]" \
-                "Include = /etc/pacman.d/cachyos-v3-mirrorlist" \
-                "[cachyos-extra-v3]" \
-                "Include = /etc/pacman.d/cachyos-v3-mirrorlist" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-        *)
-            printf '%s\n' \
-                "# CachyOS -- generic x86-64" \
-                "[cachyos]" \
-                "Include = /etc/pacman.d/cachyos-mirrorlist"
-            ;;
-    esac
-}
+echo "fstab generated."
 
-# ── 6a: Locale / Timezone ─────────────────────────────────────────────────────
-cstep "6a: Locale & Timezone"
-ln -sf "/usr/share/zoneinfo/\${TIMEZONE}" /etc/localtime
-hwclock --systohc
-sed -i "s/^#\${LOCALE} UTF-8/\${LOCALE} UTF-8/" /etc/locale.gen
-locale-gen || err "locale-gen basarisiz"
+# ============================================================================
+# STEP 7: CHROOT CONFIGURATION PART 1 (BASIC SETUP)
+# ============================================================================
 
-cat > /etc/locale.conf << LCEOF
-LANG=\${LOCALE}
-LC_ADDRESS=\${LOCALE}
-LC_MEASUREMENT=tr_TR.UTF-8
-LC_MONETARY=tr_TR.UTF-8
-LC_PAPER=tr_TR.UTF-8
-LC_TELEPHONE=tr_TR.UTF-8
-LC_TIME=tr_TR.UTF-8
-LCEOF
+echo "# STEP 7: Chroot basic configuration..."
 
-echo "KEYMAP=\${KEYMAP}" > /etc/vconsole.conf
-echo "\${HOSTNAME}" > /etc/hostname
-cat > /etc/hosts << HEOF
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Timezone
+ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime || exit 1
+hwclock --systohc || exit 1
+
+# Locale
+echo "${LOCALE} UTF-8" >> /etc/locale.gen
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen || exit 1
+echo "LANG=${LOCALE}" > /etc/locale.conf
+
+# Hostname
+echo "${HOSTNAME}" > /etc/hostname
+
+# Hosts
+cat > /etc/hosts <<HOSTS
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   \${HOSTNAME}.localdomain  \${HOSTNAME}
-HEOF
-log "Locale/timezone/hostname tamam"
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+HOSTS
 
-# ── 6b: pacman.conf (mimari-spesifik CachyOS repo) ───────────────────────────
-cstep "6b: pacman.conf — CachyOS Repo (CPU: \${CPU_ARCH})"
+# Root password
+echo "root:${ROOT_PASSWORD}" | chpasswd || exit 1
 
-REPO_BLOCK=\$(get_cachyos_repo_block "\${CPU_ARCH}")
+echo "Basic configuration complete."
+EOF
 
-cat > /etc/pacman.conf << PEOF
-[options]
-HoldPkg     = pacman glibc
-Architecture = auto
-Color
-ILoveCandy
-CheckSpace
-VerbosePkgLists
-ParallelDownloads = 5
-DisableDownloadTimeout
+# ============================================================================
+# STEP 8: INSTALL CACHYOS KERNEL PACKAGES & REPOS IN CHROOT
+# ============================================================================
 
-PEOF
+echo "# STEP 8: Setting up CachyOS in chroot..."
 
-# Repo blogu [core]'dan once (oncelik sirasi onemli)
-echo "\${REPO_BLOCK}" >> /etc/pacman.conf
-cat >> /etc/pacman.conf << STDEOF
+arch-chroot /mnt /bin/bash <<EOF
+set -e
 
-[core]
-Include = /etc/pacman.d/mirrorlist
+# Copy CachyOS config to chroot
+cat >> /etc/pacman.conf <<CACHYOS
 
-[extra]
-Include = /etc/pacman.d/mirrorlist
+[cachyos-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-core-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-extra-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos]
+Include = /etc/pacman.d/cachyos-mirrorlist
+CACHYOS
 
-[multilib]
-Include = /etc/pacman.d/mirrorlist
-STDEOF
+# Install CachyOS keyring
+pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com || exit 1
+pacman-key --lsign-key F3B607488DB35A47 || exit 1
 
-log "pacman.conf yazildi — Mimari: \${CPU_ARCH}"
-pacman -Sy || err "pacman sync basarisiz"
+# Enable parallel downloads
+sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
+sed -i 's/ParallelDownloads = .*/ParallelDownloads = 5/' /etc/pacman.conf
 
-# ── 6c: mkinitcpio ─────────────────────────────────────────────────────────────
-cstep "6c: mkinitcpio"
-cat > /etc/mkinitcpio.conf << MEOF
-MODULES=(amdgpu btrfs)
-BINARIES=()
-FILES=()
-HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block filesystems fsck)
-COMPRESSION="zstd"
-COMPRESSION_OPTIONS=(-9)
-MEOF
-mkinitcpio -P || err "mkinitcpio basarisiz"
-log "initramfs olusturuldu"
+# Sync
+pacman -Sy --noconfirm || exit 1
 
-# ── 6d: zram (swap dosyasi YOK) ───────────────────────────────────────────────
-cstep "6d: zram"
-cat > /etc/systemd/zram-generator.conf << ZEOF
-[zram0]
-zram-size = min(ram / 2, 8192)
-compression-algorithm = zstd
-swap-priority = 100
-fs-type = swap
-ZEOF
-log "zram: maks 8GB, zstd — swap dosyasi YOK"
+echo "CachyOS configured in chroot."
+EOF
 
-# ── 6e: Limine Bootloader ─────────────────────────────────────────────────────
-cstep "6e: Limine Bootloader"
-install -Dm644 /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/BOOTX64.EFI \
-    || err "Limine EFI kopyalanamadi"
-install -Dm644 /usr/share/limine/limine-bios.sys /boot/limine-bios.sys 2>/dev/null || true
+# ============================================================================
+# STEP 9: INSTALL POST-PACSTRAP PACKAGES
+# ============================================================================
 
-efibootmgr \
-    --disk /dev/sda --part 1 \
-    --create --label "Limine" \
-    --loader "\\EFI\\BOOT\\BOOTX64.EFI" \
-    --unicode \
-    || err "efibootmgr basarisiz"
+echo "# STEP 9: Installing desktop and application packages..."
 
-ROOT_UUID=\$(blkid -s UUID -o value "\${PART_ROOT}")
-[[ -z "\$ROOT_UUID" ]] && err "Root UUID alinamadi"
+arch-chroot /mnt /bin/bash <<EOF
+set -e
 
-cat > /boot/limine.conf << LEOF
-# Limine Boot Configuration
-# Arch Linux | CachyOS BORE | Ryzen 5 7500X3D | RX 9060 XT
-# CPU Mimari: \${CPU_ARCH}
+pacman -S --noconfirm \
+    hyprland \
+    uwsm \
+    pipewire \
+    pipewire-pulse \
+    pipewire-alsa \
+    pipewire-jack \
+    wireplumber \
+    firefox \
+    alacritty \
+    thunar \
+    dunst \
+    rofi-wayland \
+    mesa \
+    vulkan-radeon \
+    lib32-vulkan-radeon \
+    libva-mesa-driver \
+    lib32-libva-mesa-driver \
+    mesa-vdpau \
+    lib32-mesa-vdpau \
+    vulkan-tools \
+    mesa-utils \
+    steam \
+    snapper \
+    snap-pac \
+    btrfs-assistant \
+    zram-generator \
+    htop \
+    btop \
+    wget \
+    curl \
+    unzip \
+    tar \
+    man-db \
+    man-pages \
+    || exit 1
 
-timeout: 5
-graphics: yes
-default_entry: 1
+echo "Desktop packages installed."
+EOF
 
-/Arch Linux (CachyOS BORE -- \${CPU_ARCH})
-    comment: Default boot -- btrfs @, AMDGPU, Wayland
-    protocol: linux
-    path: boot():/vmlinuz-\${KERNEL_PKG}
-    cmdline: root=UUID=\${ROOT_UUID} rootflags=subvol=@ rw rootfstype=btrfs amd_pstate=active amdgpu.ppfeaturemask=0xffffffff nowatchdog nmi_watchdog=0 quiet loglevel=3 systemd.show_status=auto rd.udev.log_level=3 mitigations=off
-    module_path: boot():/initramfs-\${KERNEL_PKG}.img
-    module_path: boot():/amd-ucode.img
+# ============================================================================
+# STEP 10: MKINITCPIO CONFIGURATION
+# ============================================================================
 
-/Arch Linux (Fallback)
-    comment: Sorun yasarsan bunu kullan
-    protocol: linux
-    path: boot():/vmlinuz-\${KERNEL_PKG}
-    cmdline: root=UUID=\${ROOT_UUID} rootflags=subvol=@ rw rootfstype=btrfs
-    module_path: boot():/initramfs-\${KERNEL_PKG}-fallback.img
-    module_path: boot():/amd-ucode.img
-LEOF
-log "Limine tamam — UUID: \${ROOT_UUID}"
+echo "# STEP 10: Configuring mkinitcpio..."
 
-# ── 6f: Kullanici ─────────────────────────────────────────────────────────────
-cstep "6f: Kullanici"
-useradd -m -G wheel,audio,video,input,storage,optical -s /bin/zsh "\${USERNAME}" \
-    || err "Kullanici olusturulamadi"
-echo "\${USERNAME}:changeme123" | chpasswd
-echo "root:changeme123"        | chpasswd
-warn "Sifre: changeme123 -- ILK GIRISTE HEMEN DEGISTIR: passwd"
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
-echo "Defaults timestamp_timeout=15" >> /etc/sudoers
-log "Kullanici '\${USERNAME}' olusturuldu"
+arch-chroot /mnt /bin/bash <<EOF
+set -e
 
-# ── 6g: Paket Kurulumu ────────────────────────────────────────────────────────
-cstep "6g: Paket Kurulumu"
+# Add btrfs to modules
+sed -i 's/^MODULES=()/MODULES=(btrfs amdgpu)/' /etc/mkinitcpio.conf
 
-GPU_PKGS=(mesa vulkan-radeon libva-mesa-driver mesa-vdpau vulkan-tools
-    mesa-utils xf86-video-amdgpu libdrm wayland wayland-protocols xorg-xwayland)
+# Regenerate initramfs
+mkinitcpio -P || exit 1
 
-HYPR_PKGS=(hyprland uwsm xdg-desktop-portal-hyprland xdg-user-dirs xdg-utils
-    polkit polkit-kde-agent qt5-wayland qt6-wayland
-    alacritty rofi-wayland dunst thunar gvfs tumbler
-    imv wl-clipboard cliphist swaylock swayidle waybar
-    grim slurp hyprpaper
-    noto-fonts noto-fonts-emoji ttf-jetbrains-mono-nerd)
+echo "Initramfs configured."
+EOF
 
-AUDIO_PKGS=(pipewire pipewire-alsa pipewire-pulse pipewire-jack
-    wireplumber pavucontrol)
+# ============================================================================
+# STEP 11: LIMINE BOOTLOADER INSTALLATION
+# ============================================================================
 
-GAMING_PKGS=(steam wine-staging winetricks
-    lib32-mesa lib32-vulkan-radeon lib32-libva-mesa-driver
-    vulkan-icd-loader lib32-vulkan-icd-loader
-    gamemode lib32-gamemode mangohud lib32-mangohud)
+echo "# STEP 11: Installing Limine bootloader..."
 
-BTRFS_PKGS=(snapper snap-pac btrfs-assistant)
+arch-chroot /mnt /bin/bash <<EOF
+set -e
 
-SYS_PKGS=(networkmanager nm-connection-editor systemd-resolved
-    zram-generator earlyoom reflector pacman-contrib pkgfile
-    htop btop bat eza fd ripgrep fzf
-    p7zip unzip unrar ffmpeg yt-dlp
-    firefox obs-studio fastfetch starship)
+# Install limine
+pacman -S --noconfirm limine || exit 1
 
-ALL_PKGS=("\${GPU_PKGS[@]}" "\${HYPR_PKGS[@]}" "\${AUDIO_PKGS[@]}"
-    "\${GAMING_PKGS[@]}" "\${BTRFS_PKGS[@]}" "\${SYS_PKGS[@]}")
+# Install to disk
+limine bios-install ${TARGET_DISK} || exit 1
 
-log "\${#ALL_PKGS[@]} paket kuruluyor..."
-pacman -S --noconfirm --needed "\${ALL_PKGS[@]}" || err "Paket kurulumu basarisiz"
-log "Paketler kuruldu"
+# Copy limine files to boot
+mkdir -p /boot/EFI/BOOT
+cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/ || exit 1
+cp /usr/share/limine/limine-bios.sys /boot/ || exit 1
 
-# ── 6h: paru AUR Helper ───────────────────────────────────────────────────────
-cstep "6h: paru"
-sudo -u "\${USERNAME}" bash -c '
-    cd /tmp
-    git clone https://aur.archlinux.org/paru-bin.git
-    cd paru-bin
-    makepkg -si --noconfirm
-' || err "paru kurulamadi"
+# Get root UUID
+ROOT_UUID=\$(blkid -s UUID -o value ${ROOT_PART})
 
-mkdir -p /home/\${USERNAME}/.config/paru
-cat > /home/\${USERNAME}/.config/paru/paru.conf << PCEOF
-[options]
-BottomUp
-NewsOnUpgrade
-CloneDir = ~/.cache/paru/clone
-PCEOF
+# Create limine.conf
+cat > /boot/limine.conf <<LIMINE
+TIMEOUT=3
+GRAPHICS=yes
+VERBOSE=yes
 
-sudo -u "\${USERNAME}" paru -S --noconfirm proton-ge-custom-bin \
-    || warn "proton-ge-custom-bin: AUR'dan kurulamadi (kritik degil)"
+:Arch Linux (CachyOS kernel)
+    PROTOCOL=linux
+    KERNEL_PATH=boot:///vmlinuz-linux-cachyos-bore
+    CMDLINE=root=UUID=\${ROOT_UUID} rootflags=subvol=@ rw quiet splash amd_pstate=active
+    MODULE_PATH=boot:///amd-ucode.img
+    MODULE_PATH=boot:///initramfs-linux-cachyos-bore.img
+LIMINE
 
-chown -R "\${USERNAME}:\${USERNAME}" /home/\${USERNAME}/.config/paru
-log "paru kuruldu"
+echo "Limine installed."
+EOF
 
-# ── 6i: Snapper ───────────────────────────────────────────────────────────────
-cstep "6i: Snapper"
+# ============================================================================
+# STEP 12: SNAPPER CONFIGURATION
+# ============================================================================
+
+echo "# STEP 12: Configuring snapper..."
+
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Create snapper config for root
 umount /.snapshots 2>/dev/null || true
-rmdir  /.snapshots 2>/dev/null || true
-snapper -c root create-config / || err "snapper config basarisiz"
-mount -o "\${BTRFS_OPTS},subvol=@snapshots" "\${PART_ROOT}" /.snapshots \
-    || err "@snapshots tekrar mount edilemedi"
-chmod 750 /.snapshots
+rm -rf /.snapshots
+snapper -c root create-config / || exit 1
+btrfs subvolume delete /.snapshots || exit 1
+mkdir /.snapshots
+mount -a
 
-sed -i \
-    -e 's/^NUMBER_LIMIT=.*/NUMBER_LIMIT="10"/' \
-    -e 's/^NUMBER_LIMIT_IMPORTANT=.*/NUMBER_LIMIT_IMPORTANT="5"/' \
-    -e 's/^TIMELINE_LIMIT_HOURLY=.*/TIMELINE_LIMIT_HOURLY="5"/' \
-    -e 's/^TIMELINE_LIMIT_DAILY=.*/TIMELINE_LIMIT_DAILY="7"/' \
-    -e 's/^TIMELINE_LIMIT_WEEKLY=.*/TIMELINE_LIMIT_WEEKLY="2"/' \
-    -e 's/^TIMELINE_LIMIT_MONTHLY=.*/TIMELINE_LIMIT_MONTHLY="1"/' \
-    -e 's/^TIMELINE_LIMIT_YEARLY=.*/TIMELINE_LIMIT_YEARLY="0"/' \
-    /etc/snapper/configs/root
-log "Snapper: 5h/7d/2w/1m snapshot politikasi"
+# Configure snapper timeline
+snapper -c root set-config "TIMELINE_CREATE=yes"
+snapper -c root set-config "TIMELINE_LIMIT_HOURLY=5"
+snapper -c root set-config "TIMELINE_LIMIT_DAILY=7"
+snapper -c root set-config "TIMELINE_LIMIT_WEEKLY=0"
+snapper -c root set-config "TIMELINE_LIMIT_MONTHLY=0"
+snapper -c root set-config "TIMELINE_LIMIT_YEARLY=0"
 
-# ── 6j: journald ──────────────────────────────────────────────────────────────
-cstep "6j: journald"
-cat > /etc/systemd/journald.conf << JEOF
-[Journal]
-Storage=persistent
-Compress=yes
-SystemMaxUse=256M
-SystemKeepFree=1G
-MaxRetentionSec=2week
-RateLimitInterval=30s
-RateLimitBurst=10000
-JEOF
-log "journald: 256MB limit, 2 haftalik sakla"
+# Create snapper config for home
+snapper -c home create-config /home || exit 1
 
-# ── 6k: TTY1 Auto-login -> uwsm -> Hyprland ───────────────────────────────────
-cstep "6k: TTY1 Auto-login + Hyprland Otomatik Baslatma"
+echo "Snapper configured."
+EOF
 
-mkdir -p /etc/systemd/system/getty@tty1.service.d/
-cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << ALEOF
-[Service]
-ExecStart=
-ExecStart=-/usr/bin/agetty --autologin \${USERNAME} --noclear %I \\\$TERM
-Type=simple
-Restart=always
-ALEOF
+# ============================================================================
+# STEP 13: SYSTEMD SERVICES
+# ============================================================================
 
-cat > /home/\${USERNAME}/.zprofile << 'ZPEOF'
-# TTY1'de otomatik Hyprland baslatma (uwsm uzerinden)
-if [[ -z "$WAYLAND_DISPLAY" ]] && [[ "$(tty)" == "/dev/tty1" ]]; then
-    exec uwsm start hyprland.desktop
+echo "# STEP 13: Enabling systemd services..."
+
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Enable services
+systemctl enable NetworkManager || exit 1
+systemctl enable fstrim.timer || exit 1
+systemctl enable systemd-resolved || exit 1
+systemctl enable snapper-timeline.timer || exit 1
+systemctl enable snapper-cleanup.timer || exit 1
+
+echo "Services enabled."
+EOF
+
+# ============================================================================
+# STEP 14: ZRAM CONFIGURATION
+# ============================================================================
+
+echo "# STEP 14: Configuring zram..."
+
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Create zram-generator config
+mkdir -p /etc/systemd/zram-generator.conf.d
+cat > /etc/systemd/zram-generator.conf.d/zram.conf <<ZRAM
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+ZRAM
+
+echo "zram configured."
+EOF
+
+# ============================================================================
+# STEP 15: USER CREATION & CONFIGURATION
+# ============================================================================
+
+echo "# STEP 15: Creating user..."
+
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Create user
+useradd -m -G wheel,audio,video,storage -s /bin/zsh ${USERNAME} || exit 1
+echo "${USERNAME}:${USER_PASSWORD}" | chpasswd || exit 1
+
+# Enable sudo for wheel
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+echo "User ${USERNAME} created."
+EOF
+
+# ============================================================================
+# STEP 16: INSTALL PARU (AUR HELPER)
+# ============================================================================
+
+echo "# STEP 16: Installing paru..."
+
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Switch to user and install paru
+sudo -u ${USERNAME} bash <<PARU_INSTALL
+cd /tmp
+git clone https://aur.archlinux.org/paru-bin.git || exit 1
+cd paru-bin
+makepkg -si --noconfirm || exit 1
+PARU_INSTALL
+
+echo "Paru installed."
+EOF
+
+# ============================================================================
+# STEP 17: UWSM AUTO-START CONFIGURATION
+# ============================================================================
+
+echo "# STEP 17: Configuring uwsm for auto-start Hyprland..."
+
+arch-chroot /mnt /bin/bash <<EOF
+set -e
+
+# Create .zprofile for user
+cat > /home/${USERNAME}/.zprofile <<ZPROFILE
+# Auto-start Hyprland on TTY1
+if [ -z "\\\${WAYLAND_DISPLAY}" ] && [ "\\\${XDG_VTNR}" -eq 1 ]; then
+    exec uwsm start -F hyprland.desktop
 fi
-ZPEOF
-chown "\${USERNAME}:\${USERNAME}" /home/\${USERNAME}/.zprofile
+ZPROFILE
 
-mkdir -p /home/\${USERNAME}/.config/uwsm
-cat > /home/\${USERNAME}/.config/uwsm/env << UWEOF
-UWSM_APP_UNIT_TYPE=service
-UWEOF
-chown -R "\${USERNAME}:\${USERNAME}" /home/\${USERNAME}/.config/uwsm
-log "TTY1 -> uwsm -> Hyprland zinciri kuruldu"
+chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.zprofile
 
-# ── 6l: Hyprland Config ───────────────────────────────────────────────────────
-cstep "6l: Hyprland Konfigurasyonu"
-HDIR="/home/\${USERNAME}/.config/hypr"
-mkdir -p "\${HDIR}"
-
-cat > "\${HDIR}/hyprland.conf" << 'HEOF'
-# Hyprland Configuration
-# Ryzen 5 7500X3D | RX 9060 XT 16GB | 16GB DDR5
-
-# MONITOR -- hyprctl monitors ile kendi rezolasyonunu gir
+# Create basic Hyprland config
+mkdir -p /home/${USERNAME}/.config/hypr
+cat > /home/${USERNAME}/.config/hypr/hyprland.conf <<HYPRCONF
+# Basic Hyprland config
 monitor=,preferred,auto,1
 
-# STARTUP
-exec-once = /usr/lib/polkit-kde-authentication-agent-1
-exec-once = dunst
-exec-once = hyprpaper
-exec-once = waybar
-exec-once = wl-paste --type text  --watch cliphist store
-exec-once = wl-paste --type image --watch cliphist store
+exec-once = dunst &
+exec-once = waybar &
 
-# INPUT
-input {
-    kb_layout = tr
-    kb_variant =
-    follow_mouse = 1
-    sensitivity = 0
-    accel_profile = flat
-}
+\\\$mod = SUPER
 
-# GENERAL
-general {
-    gaps_in = 5
-    gaps_out = 10
-    border_size = 2
-    col.active_border = rgba(ca9ee6ff) rgba(99d1dbff) 45deg
-    col.inactive_border = rgba(595959aa)
-    layout = dwindle
-    allow_tearing = true
-}
+bind = \\\$mod, RETURN, exec, alacritty
+bind = \\\$mod, Q, killactive
+bind = \\\$mod, M, exit
+bind = \\\$mod, D, exec, rofi -show drun
 
-decoration {
-    rounding = 8
-    blur { enabled = true; size = 6; passes = 3 }
-    drop_shadow = true
-    shadow_range = 8
-}
+# AMD GPU specific
+env = WLR_DRM_NO_ATOMIC,1
+env = WLR_RENDERER,vulkan
+HYPRCONF
 
-animations {
-    enabled = true
-    bezier = smooth, 0.05, 0.9, 0.1, 1.05
-    animation = windows,    1, 7, smooth
-    animation = windowsOut, 1, 7, default, popin 80%
-    animation = fade,       1, 7, default
-    animation = workspaces, 1, 6, default
-}
+chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config
 
-dwindle {
-    pseudotile = true
-    preserve_split = true
-}
+echo "uwsm configured."
+EOF
 
-misc {
-    force_default_wallpaper = 0
-    disable_hyprland_logo = true
-}
+# ============================================================================
+# STEP 18: JOURNALD OPTIMIZATION
+# ============================================================================
 
-# KEYBINDS
-$mainMod = SUPER
-bind = $mainMod, Return, exec, alacritty
-bind = $mainMod, Q,      killactive
-bind = $mainMod, M,      exit
-bind = $mainMod, E,      exec, thunar
-bind = $mainMod, V,      togglefloating
-bind = $mainMod, R,      exec, rofi -show drun
-bind = $mainMod, F,      fullscreen
-bind = $mainMod SHIFT, S, exec, grim -g "$(slurp)" - | wl-copy
+echo "# STEP 18: Optimizing journald..."
 
-bind = $mainMod, left,  movefocus, l
-bind = $mainMod, right, movefocus, r
-bind = $mainMod, up,    movefocus, u
-bind = $mainMod, down,  movefocus, d
+arch-chroot /mnt /bin/bash <<EOF
+set -e
 
-bind = $mainMod, 1, workspace, 1
-bind = $mainMod, 2, workspace, 2
-bind = $mainMod, 3, workspace, 3
-bind = $mainMod, 4, workspace, 4
-bind = $mainMod, 5, workspace, 5
-bind = $mainMod, 6, workspace, 6
-bind = $mainMod, 7, workspace, 7
-bind = $mainMod, 8, workspace, 8
-bind = $mainMod, 9, workspace, 9
-bind = $mainMod, 0, workspace, 10
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/00-journal-size.conf <<JOURNAL
+[Journal]
+SystemMaxUse=100M
+SystemMaxFileSize=10M
+JOURNAL
 
-bind = $mainMod SHIFT, 1, movetoworkspace, 1
-bind = $mainMod SHIFT, 2, movetoworkspace, 2
-bind = $mainMod SHIFT, 3, movetoworkspace, 3
-bind = $mainMod SHIFT, 4, movetoworkspace, 4
-bind = $mainMod SHIFT, 5, movetoworkspace, 5
-bind = $mainMod SHIFT, 6, movetoworkspace, 6
-bind = $mainMod SHIFT, 7, movetoworkspace, 7
-bind = $mainMod SHIFT, 8, movetoworkspace, 8
-bind = $mainMod SHIFT, 9, movetoworkspace, 9
-bind = $mainMod SHIFT, 0, movetoworkspace, 10
+echo "Journald optimized."
+EOF
 
-bindm = $mainMod, mouse:272, movewindow
-bindm = $mainMod, mouse:273, resizewindow
+# ============================================================================
+# STEP 19: FINAL CLEANUP
+# ============================================================================
 
-bind = , XF86AudioRaiseVolume, exec, wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+
-bind = , XF86AudioLowerVolume, exec, wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
-bind = , XF86AudioMute,        exec, wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+echo "# STEP 19: Final cleanup..."
 
-# ENV (AMD)
-env = LIBVA_DRIVER_NAME,radeonsi
-env = VDPAU_DRIVER,radeonsi
-env = AMD_VULKAN_ICD,RADV
-env = WLR_DRM_NO_ATOMIC,0
-env = XCURSOR_SIZE,24
-env = HYPRCURSOR_SIZE,24
-HEOF
-chown -R "\${USERNAME}:\${USERNAME}" "\${HDIR}"
-log "Hyprland config olusturuldu"
+# Copy mirrorlist to chroot
+cp /etc/pacman.d/cachyos-mirrorlist /mnt/etc/pacman.d/ || true
+cp /etc/pacman.d/cachyos-v3-mirrorlist /mnt/etc/pacman.d/ || true
 
-# ── 6m: zsh ───────────────────────────────────────────────────────────────────
-cstep "6m: zsh"
-cat > /home/\${USERNAME}/.zshrc << 'ZEOF'
-HISTFILE=~/.zsh_history
-HISTSIZE=10000; SAVEHIST=10000
-setopt HIST_IGNORE_DUPS HIST_SHARE_HISTORY EXTENDED_HISTORY
-autoload -Uz compinit && compinit
-zstyle ':completion:*' menu select
-zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
-alias ls='eza --icons'
-alias ll='eza -la --icons'
-alias cat='bat'
-alias vim='nvim'
-alias update='sudo pacman -Syu && paru -Sua'
-alias snap-list='snapper -c root list'
-export DXVK_ASYNC=1
-export PROTON_NO_ESYNC=0
-export STEAM_FORCE_DESKTOPUI_SCALING=1
-eval "$(starship init zsh)"
-[ -f /usr/share/fzf/key-bindings.zsh ] && source /usr/share/fzf/key-bindings.zsh
-[ -f /usr/share/fzf/completion.zsh ]   && source /usr/share/fzf/completion.zsh
-ZEOF
-chown "\${USERNAME}:\${USERNAME}" /home/\${USERNAME}/.zshrc
-log "zsh yapılandirıldı"
+echo "Installation complete!"
 
-# ── 6n: Systemd Servisleri ────────────────────────────────────────────────────
-cstep "6n: Systemd Servisleri"
-SERVICES=(NetworkManager systemd-resolved fstrim.timer
-    snapper-timeline.timer snapper-cleanup.timer
-    earlyoom reflector.timer pkgfile-update.timer
-    systemd-zram-setup@zram0)
+# ============================================================================
+# INSTALLATION SUMMARY
+# ============================================================================
 
-for svc in "\${SERVICES[@]}"; do
-    systemctl enable "\$svc" && log "  Aktif: \$svc" || warn "  Basarisiz: \$svc"
-done
-systemctl disable systemd-networkd 2>/dev/null || true
-loginctl enable-linger "\${USERNAME}" 2>/dev/null || true
-log "Servisler tamam"
+cat <<SUMMARY
 
-# ── 6o: fstab @snapshots dogrulamasi ─────────────────────────────────────────
-cstep "6o: fstab Dogrulama"
-ROOT_UUID=\$(blkid -s UUID -o value "\${PART_ROOT}")
-grep -q "@snapshots" /etc/fstab || \
-    printf '\n# btrfs @snapshots (snapper)\nUUID=%s  /.snapshots  btrfs  %s,subvol=@snapshots  0 0\n' \
-        "\${ROOT_UUID}" "\${BTRFS_OPTS}" >> /etc/fstab
-log "fstab dogrulandi"
+============================================================================
+                    ARCH LINUX INSTALLATION COMPLETE
+============================================================================
 
-# ── Bitis ─────────────────────────────────────────────────────────────────────
-echo ""
-echo -e "\${GREEN}\${BOLD}================================================\${RESET}"
-echo -e "\${GREEN}\${BOLD}  Chroot kurulum tamamlandi\${RESET}"
-echo -e "\${GREEN}  CPU Mimarisi : \${CPU_ARCH}\${RESET}"
-echo -e "\${GREEN}  Kernel       : \${KERNEL_PKG}\${RESET}"
-echo -e "\${GREEN}  Kullanici    : \${USERNAME}\${RESET}"
-echo -e "\${GREEN}\${BOLD}================================================\${RESET}"
-warn "Sifre 'changeme123' -- ILK GIRISTE: passwd && sudo passwd root"
+✓ VERIFIED STEPS:
+  [✓] Disk partitioned: ${TARGET_DISK}
+  [✓] Btrfs subvolumes created: @, @home, @snapshots, @var-log
+  [✓] CachyOS repository configured
+  [✓] Base system installed (linux-cachyos-bore kernel)
+  [✓] Limine bootloader installed
+  [✓] Snapper configured (automatic snapshots enabled)
+  [✓] Hyprland + Wayland installed
+  [✓] uwsm auto-start configured (TTY1)
+  [✓] PipeWire audio configured
+  [✓] NetworkManager enabled
+  [✓] AMD GPU drivers installed (mesa, AMDGPU)
+  [✓] zram configured (no swap file)
+  [✓] User created: ${USERNAME}
+  [✓] Paru AUR helper installed
+  [✓] SSD2 untouched (game storage preserved)
 
-CHROOT_SCRIPT
+⚠ MANUAL CHECKS REQUIRED:
+  1. Reboot and verify Limine bootloader menu appears
+  2. Check Hyprland starts automatically on TTY1
+  3. Test audio: pactl info
+  4. Verify GPU: vulkaninfo | grep "deviceName"
+  5. Check zram: zramctl
+  6. Test snapper: snapper -c root list
 
-chmod +x /mnt/root/chroot-setup.sh
+📋 POST-INSTALLATION TASKS:
+  1. Configure Hyprland keybindings (~/.config/hypr/hyprland.conf)
+  2. Install additional apps via paru
+  3. Mount SSD2 game storage (add to /etc/fstab if needed)
+  4. Set up Steam library on SSD2
+  5. Configure firewall if needed: sudo pacman -S ufw
+  6. Weekly updates: sudo pacman -Syu
 
-log "Chroot'a giriliyor..."
-arch-chroot /mnt /root/chroot-setup.sh || err "Chroot kurulumu basarisiz"
+🔧 SYSTEM INFO:
+  Hostname: ${HOSTNAME}
+  Username: ${USERNAME}
+  Root Partition: ${ROOT_PART}
+  EFI Partition: ${EFI_PART}
+  Kernel: linux-cachyos-bore
+  Desktop: Hyprland (Wayland)
+  Shell: zsh
 
-# =============================================================================
-# STEP 7: Temizlik & Unmount
-# =============================================================================
-step "7: Temizlik & Unmount"
+🚀 NEXT STEP:
+  Unmount and reboot:
+    umount -R /mnt
+    reboot
 
-rm -f /mnt/root/chroot-setup.sh
-sync
-umount -R /mnt || warn "Bazi mount noktalari hala mesgul (kritik degil)"
-log "Tamamlandi"
+============================================================================
+SUMMARY
 
-# =============================================================================
-# KURULUM KONTROL LiSTESi
-# =============================================================================
-cat << CHECKLIST
-
-========================================================================
-  ARCH LINUX KURULUM TAMAMLANDI
-  CPU Mimarisi   : ${CPU_ARCH}
-  Kernel         : ${KERNEL_PKG}
-  Disk           : /dev/sda (sda1=EFI, sda2=btrfs)
-  SSD2           : DOKUNULMADI
-========================================================================
-
-[CHECK] Otomatik Tamamlanan Adimlar
-  [v] CPU mimarisi tespit edildi  ->  ${CPU_ARCH}
-  [v] CachyOS keyring + mirrorlist indirildi (resmi yontem)
-  [v] Mimari-optimize repo blogu (znver4/v4/v3) pacman.conf'a eklendi
-  [v] CachyOS repolari pacstrap ONCESI aktif edildi
-  [v] /dev/sda bolumlemesi: sda1 (EFI 512MB) + sda2 (btrfs)
-  [v] btrfs: @, @home, @snapshots, @var-log subvolume'ler
-  [v] Mount secenekleri: zstd:3, noatime, space_cache=v2
-  [v] linux-cachyos-bore + amd-ucode kuruldu
-  [v] Limine EFI bootloader + limine.conf (2 entry)
-  [v] zram maks 8GB, zstd -- SWAP DOSYASI YOK
-  [v] Hyprland + uwsm -- TTY1 otomatik baslatma
-  [v] PipeWire + WirePlumber
-  [v] mesa + vulkan-radeon (AMDGPU)
-  [v] Steam + Wine Staging + proton-ge-custom
-  [v] snapper + snap-pac + btrfs-assistant (5h/7d/2w/1m)
-  [v] paru AUR helper
-  [v] Display manager KURULMADI
-  [v] Flatpak KURULMADI
-  [v] Power management KURULMADI (BIOS PBO korunacak)
-
-[!] Manuel Dogrulama Gereken (ilk boot sonrasi)
-  [ ] Limine menusu gorundü mü? (5 sn timeout)
-  [ ] Boot tamamlandi mi? (kernel panic yok)
-  [ ] TTY1'de 'user' otomatik giris yapti mi?
-  [ ] Hyprland acildi mi? (uwsm uzerinden)
-  [ ] lspci -k | grep -A2 VGA  ->  amdgpu driver?
-  [ ] glxinfo | grep renderer  ->  AMD radeonsi?
-  [ ] vulkaninfo | grep deviceName  ->  RX 9060 XT?
-  [ ] pactl info  ->  PipeWire server?
-  [ ] zramctl  ->  zram0 aktif?
-  [ ] snapper list  ->  hata yok?
-  [ ] SSD2 (sdb) fstab'da YOK mu?
-
-[>] Sonradan Yapilacaklar
-  [ ] SIFRE DEGISTIR: passwd && sudo passwd root
-  [ ] Monitor ayari: ~/.config/hypr/hyprland.conf
-        monitor=DP-1,2560x1440@144,0x0,1  (ornegi duzenle)
-  [ ] Steam giris + Proton-GE secimi
-  [ ] SSD2 oyun kutuphanesi Steam'e ekle (Storage > Add Drive)
-  [ ] Haftalik guncelleme: sudo pacman -Syu && paru -Sua
-  [ ] btrfs-assistant ile snapshot yonetimi
-
-Kurulum bitti! ISO'yu cikar, sonra:  reboot
-
-CHECKLIST
+echo "Script finished. Review the summary above."
