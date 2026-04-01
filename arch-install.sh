@@ -169,7 +169,7 @@ reflector --country Turkey,Germany,Netherlands \
 log "Running pacstrap..."
 pacstrap -K /mnt \
   base base-devel \
-  linux-cachyos-bore linux-cachyos-bore-headers \
+  linux-cachyos linux-cachyos-headers \
   linux-firmware \
   amd-ucode \
   btrfs-progs \
@@ -357,22 +357,22 @@ default_entry: 1
 /Arch Linux (CachyOS BORE)
     comment: Default — btrfs @, AMDGPU, Wayland
     protocol: linux
-    path: boot():/vmlinuz-linux-cachyos-bore
+    path: boot():/vmlinuz-linux-cachyos
     cmdline: root=UUID=${ROOT_UUID} rootflags=subvol=@ rw rootfstype=btrfs \\
              amd_pstate=active \\
              amdgpu.ppfeaturemask=0xffffffff \\
              nowatchdog nmi_watchdog=0 \\
              quiet loglevel=3 systemd.show_status=auto rd.udev.log_level=3 \\
              mitigations=off
-    module_path: boot():/initramfs-linux-cachyos-bore.img
+    module_path: boot():/initramfs-linux-cachyos.img
     module_path: boot():/amd-ucode.img
 
 /Arch Linux (Fallback initramfs)
     comment: Fallback — use if default fails
     protocol: linux
-    path: boot():/vmlinuz-linux-cachyos-bore
+    path: boot():/vmlinuz-linux-cachyos
     cmdline: root=UUID=${ROOT_UUID} rootflags=subvol=@ rw rootfstype=btrfs
-    module_path: boot():/initramfs-linux-cachyos-bore-fallback.img
+    module_path: boot():/initramfs-linux-cachyos-fallback.img
     module_path: boot():/amd-ucode.img
 LIMINE_CONF
 
