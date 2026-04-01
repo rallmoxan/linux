@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-TARGET_DISK="/dev/nvme0n1"          # SSD1 — root + home
+TARGET_DISK="/dev/sda"          # SSD1 — root + home
 # SSD2 (/dev/nvme1n1) is NEVER touched
 EFI_SIZE="512M"
 HOSTNAME="arch"
@@ -23,8 +23,8 @@ USERNAME="rmx"
 USER_SHELL="/bin/zsh"
 
 # Partition labels
-PART_EFI="${TARGET_DISK}p1"
-PART_ROOT="${TARGET_DISK}p2"
+PART_EFI="${TARGET_DISK}1"
+PART_ROOT="${TARGET_DISK}2"
 
 # btrfs subvolume names
 declare -A SUBVOLS=(
@@ -39,7 +39,7 @@ BTRFS_OPTS="defaults,compress=zstd:3,noatime,nodiratime,space_cache=v2"
 # CachyOS mirror (auto-detected below; fallback hardcoded)
 CACHYOS_KEYRING_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst"
 CACHYOS_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-mirrorlist-22-1-any.pkg.tar.zst"
-CACHYOS_V4_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-v4-mirrorlist-22-1-any.pkg.tar.zst"
+CACHYOS_V4_MIRRORLIST_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-v3-mirrorlist-22-1-any.pkg.tar.zst"
 CACHYOS_REPO_PKG_URL="https://mirror.cachyos.org/repo/x86_64/cachyos/pacman-7.1.0.r9.g54d9411-2-x86_64.pkg.tar.zst"
 
 # Colors
@@ -131,20 +131,23 @@ mkdir -p "$TMP_PKG"
 
 curl -Lo "${TMP_PKG}/cachyos-keyring.pkg.tar.zst"      "$CACHYOS_KEYRING_URL"        || err "Failed to download CachyOS keyring"
 curl -Lo "${TMP_PKG}/cachyos-mirrorlist.pkg.tar.zst"   "$CACHYOS_MIRRORLIST_URL"     || err "Failed to download CachyOS mirrorlist"
-curl -Lo "${TMP_PKG}/cachyos-v4-mirrorlist.pkg.tar.zst" "$CACHYOS_V4_MIRRORLIST_URL" || err "Failed to download CachyOS v4 mirrorlist"
+curl -Lo "${TMP_PKG}/cachyos-v3-mirrorlist.pkg.tar.zst" "$CACHYOS_V4_MIRRORLIST_URL" || err "Failed to download CachyOS v3 mirrorlist"
 
 log "Installing CachyOS keyring to live ISO..."
 pacman -U --noconfirm "${TMP_PKG}/cachyos-keyring.pkg.tar.zst"        || err "Failed to install keyring"
 pacman -U --noconfirm "${TMP_PKG}/cachyos-mirrorlist.pkg.tar.zst"     || err "Failed to install mirrorlist"
-pacman -U --noconfirm "${TMP_PKG}/cachyos-v4-mirrorlist.pkg.tar.zst"  || err "Failed to install v4 mirrorlist"
+pacman -U --noconfirm "${TMP_PKG}/cachyos-v3-mirrorlist.pkg.tar.zst"  || err "Failed to install v3 mirrorlist"
 
 log "Injecting CachyOS repos into live pacman.conf..."
 cat >> /etc/pacman.conf << 'CACHYOS_REPOS'
 
 # CachyOS Repositories
-[cachyos-v4]
-Include = /etc/pacman.d/cachyos-v4-mirrorlist
-
+[cachyos-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-core-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-extra-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
 [cachyos]
 Include = /etc/pacman.d/cachyos-mirrorlist
 CACHYOS_REPOS
@@ -220,7 +223,7 @@ LOCALE="en_US.UTF-8"
 KEYMAP="us"
 HOSTNAME="arch"
 USERNAME="rmx"
-PART_ROOT="/dev/nvme0n1p2"
+PART_ROOT="/dev/sda2"
 BTRFS_OPTS="defaults,compress=zstd:3,noatime,nodiratime,space_cache=v2"
 
 # ── 5a: Locale & Timezone ────────────────────────────────────────────────────
@@ -280,9 +283,12 @@ Include = /etc/pacman.d/mirrorlist
 Include = /etc/pacman.d/mirrorlist
 
 # CachyOS Repositories
-[cachyos-v4]
-Include = /etc/pacman.d/cachyos-v4-mirrorlist
-
+[cachyos-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-core-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
+[cachyos-extra-v3]
+Include = /etc/pacman.d/cachyos-v3-mirrorlist
 [cachyos]
 Include = /etc/pacman.d/cachyos-mirrorlist
 PACMAN_CONF
@@ -327,7 +333,7 @@ install -Dm644 /usr/share/limine/limine-bios.sys /boot/limine-bios.sys 2>/dev/nu
 
 # Register with EFI
 efibootmgr \
-  --disk /dev/nvme0n1 \
+  --disk /dev/sda \
   --part 1 \
   --create \
   --label "Limine" \
@@ -336,7 +342,7 @@ efibootmgr \
   || err "efibootmgr failed"
 
 # Get root UUID
-ROOT_UUID=$(blkid -s UUID -o value /dev/nvme0n1p2)
+ROOT_UUID=$(blkid -s UUID -o value /dev/sda2)
 [[ -z "$ROOT_UUID" ]] && err "Could not determine root UUID"
 
 # Write limine.conf
@@ -832,7 +838,7 @@ log "Services configured"
 step "5o: fstab Snapshots Entry"
 
 # Ensure @snapshots is in fstab with correct options
-ROOT_UUID=$(blkid -s UUID -o value /dev/nvme0n1p2)
+ROOT_UUID=$(blkid -s UUID -o value /dev/sda2)
 grep -q "@snapshots" /etc/fstab || cat >> /etc/fstab << FSTAB_SNAP
 
 # btrfs @snapshots subvolume
